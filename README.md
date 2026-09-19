@@ -80,6 +80,66 @@ written to disk):
 uv run python main.py worker --agent-id agent_123 --token agt_… --worker-id laptop-2
 ```
 
+## Run it on Kubernetes
+
+Manifests for a local `kind` deployment live in `k8s/`: a namespace, a
+PostgreSQL `Deployment` with a `PersistentVolumeClaim` for its data and the
+same test-database init script as Compose, the relay `Deployment`/`Service`,
+and a worker `Deployment` (see below). Both the relay and worker containers
+have an `initContainer` that waits on `pg_isready` before starting, since the
+app connects to the database at import time with no retry.
+
+```bash
+docker build -t agent-relay:latest .
+kind create cluster --name agent-relay --config kind-config.yaml
+kind load docker-image agent-relay:latest --name agent-relay
+kubectl apply -f k8s/
+```
+
+`kind-config.yaml` maps container port `30080` to host port `8000`, and the
+relay `Service` is a fixed-`nodePort` `NodePort` on `30080`, so once the pods
+are ready (`kubectl -n agent-relay get pods`) the app is reachable the same
+way as Compose, at <http://127.0.0.1:8000/>, with no `kubectl port-forward`
+needed. `/health` and `/ready` back the container's liveness/readiness
+probes.
+
+Rebuilding the image after a code change requires re-running `kind load
+docker-image` (kind's node has its own image cache, separate from the host's
+Docker daemon) followed by `kubectl -n agent-relay rollout restart deployment
+agent-relay` (and `agent-relay-worker`, if it changed) to roll the new image
+out, since the tag itself (`:latest`) doesn't change.
+
+Using Docker Desktop's own Kubernetes instead of `kind` is not recommended:
+it shares the host's Docker image cache initially, but a container that has
+already pulled a given `name:tag` does not notice when that tag is
+rebuilt to point at new content, so redeploys can silently keep running a
+stale image. `kind load docker-image` avoids this by re-importing the image
+into the node explicitly on every rebuild.
+
+### Run the worker in Kubernetes
+
+`k8s/08-worker-pvc.yaml` and `k8s/09-worker-deployment.yaml` run the
+deterministic worker as a long-lived pod instead of a one-off CLI process:
+called with no `--stop-after`, `main.py worker` polls
+`/api/v1/tasks/claim` forever, so once its pod is up any task addressed to
+it is claimed and completed automatically, with no manual worker invocation.
+
+It registers itself as `uppercase` on first start and writes the resulting
+credentials to a small `PersistentVolumeClaim`, so pod restarts and
+reschedules reuse that identity instead of registering a new agent (and a
+new, disconnected task history) every time. To find its agent ID, or the
+token if you want to address tasks to it manually from the dashboard:
+
+```bash
+kubectl -n agent-relay exec deploy/agent-relay-worker -- \
+  cat /credentials/uppercase-credentials.json
+```
+
+Scaling `agent-relay-worker` to multiple replicas is safe — they'd share one
+agent identity but distinct `--worker-id`s (set from each pod's name via the
+Downward API), and claims use `SELECT ... FOR UPDATE SKIP LOCKED` so
+concurrent workers never claim the same task.
+
 ## Storage and delivery behavior
 
 `database.py` contains the SQLAlchemy models and engine setup. `storage.py`
@@ -113,6 +173,5 @@ tables on whatever `RELAY_DATABASE_URL` points at, so use a scratch database
 before running tests against another one. `docker compose up postgres` gives
 you a local server to point tests at.
 
-This starter intentionally does not include Kubernetes, CI, external brokers,
-or an LLM. Those are deployment concerns rather than part of the local relay
-protocol.
+This starter intentionally does not include CI, external brokers, or an LLM.
+Those are deployment concerns rather than part of the local relay protocol.

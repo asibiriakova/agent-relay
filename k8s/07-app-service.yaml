@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-relay
+  namespace: agent-relay
+spec:
+  type: NodePort
+  selector:
+    app: agent-relay
+  ports:
+    - port: 8000
+      targetPort: 8000
+      # Fixed so it matches kind's extraPortMappings (k8s/kind-config.yaml),
+      # which forwards host port 8000 to this NodePort. On Docker Desktop's
+      # Kubernetes this is reachable directly at localhost:30080 instead,
+      # since it auto-forwards the whole NodePort range to localhost.
+      nodePort: 30080

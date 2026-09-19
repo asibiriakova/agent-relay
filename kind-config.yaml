@@ -1,0 +1,16 @@
+# kind cluster config for Agent Relay.
+#
+# kind's default node has no host port mappings, so a NodePort Service is
+# only reachable from inside the docker network unless the node maps that
+# port to the host at cluster-creation time. Recreate the cluster with:
+#   kind delete cluster --name agent-relay
+#   kind create cluster --name agent-relay --config kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: agent-relay
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8000
+        protocol: TCP

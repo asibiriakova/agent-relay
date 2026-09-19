@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-relay-worker
+  namespace: agent-relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-relay-worker
+  template:
+    metadata:
+      labels:
+        app: agent-relay-worker
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres -p 5432 -U agent_relay; do sleep 2; done
+      containers:
+        - name: worker
+          image: agent-relay:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - uv
+            - run
+            - --frozen
+            - --no-dev
+            - python
+            - main.py
+            - worker
+          args:
+            - --base-url=http://agent-relay:8000
+            # Registers as "uppercase" once and persists the resulting
+            # identity to the PVC below, so pod restarts/reschedules reuse
+            # the same agent rather than piling up new registrations.
+            - --name=uppercase
+            - --credentials=/credentials/uppercase-credentials.json
+            - --worker-id=$(POD_NAME)
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Importing main.py (which worker.py's CLI entrypoint does) runs
+            # init_db() as a module-level side effect, so this needs the
+            # same database URL as the API server even though the worker
+            # never serves HTTP itself.
+            - name: RELAY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: RELAY_DATABASE_URL
+          volumeMounts:
+            - name: worker-credentials
+              mountPath: /credentials
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+      volumes:
+        - name: worker-credentials
+          persistentVolumeClaim:
+            claimName: worker-credentials
