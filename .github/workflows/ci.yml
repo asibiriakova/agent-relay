@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Runs the starter's protocol tests (test_agent_relay.py) and the live
+    # integration test (test_live_integration.py) in one `pytest` invocation,
+    # exactly as README.md documents, against a real PostgreSQL service
+    # container rather than mocks.
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agent_relay
+          POSTGRES_PASSWORD: agent_relay
+          POSTGRES_DB: agent_relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_relay -d agent_relay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Create test database
+        # Service containers don't run postgres-init/init-test-db.sql (that
+        # only fires for docker-entrypoint-initdb.d on a fresh volume), so
+        # create agent_relay_test the same way that script does.
+        run: |
+          uv run python -c "
+          import psycopg
+          conn = psycopg.connect(
+              'postgresql://agent_relay:agent_relay@localhost:5432/agent_relay',
+              autocommit=True,
+          )
+          conn.execute('CREATE DATABASE agent_relay_test OWNER agent_relay')
+          "
+
+      - name: Run tests
+        env:
+          RELAY_DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay@localhost:5432/agent_relay_test
+        run: uv run pytest -q
+
+  build-and-deploy:
+    # Builds the Docker image and rolls it out to the local `kind` cluster.
+    # Requires a self-hosted runner registered on the machine that owns that
+    # cluster (GitHub-hosted runners can't reach a kind cluster on your
+    # laptop). Restricted to pushes to main so PR code never runs here.
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        # Unique per build (short SHA + timestamp) rather than :latest, so
+        # each version is individually addressable in kind/kubectl and a
+        # rollout is driven by an actual Pod-spec change instead of a manual
+        # `rollout restart`.
+        id: image
+        run: echo "tag=$(git rev-parse --short HEAD)-$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: docker build -t agent-relay:${{ steps.image.outputs.tag }} .
+
+      - name: Load image into kind
+        run: kind load docker-image agent-relay:${{ steps.image.outputs.tag }} --name agent-relay
+
+      - name: Apply Kubernetes manifests
+        # Bootstraps the cluster on a first run (namespace, Postgres,
+        # Services, PVCs). The Deployments here still pin agent-relay:latest
+        # for that bootstrap/manual-README case; the freshly built tag is
+        # rolled out explicitly below.
+        run: kubectl apply -f k8s/
+
+      - name: Deploy new image and wait for rollout
+        run: |
+          kubectl -n agent-relay set image deployment/agent-relay agent-relay=agent-relay:${{ steps.image.outputs.tag }}
+          kubectl -n agent-relay set image deployment/agent-relay-worker worker=agent-relay:${{ steps.image.outputs.tag }}
+          kubectl -n agent-relay rollout status deployment/agent-relay --timeout=120s
+          kubectl -n agent-relay rollout status deployment/agent-relay-worker --timeout=120s

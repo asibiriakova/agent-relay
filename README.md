@@ -173,5 +173,27 @@ tables on whatever `RELAY_DATABASE_URL` points at, so use a scratch database
 before running tests against another one. `docker compose up postgres` gives
 you a local server to point tests at.
 
-This starter intentionally does not include CI, external brokers, or an LLM.
-Those are deployment concerns rather than part of the local relay protocol.
+This starter intentionally does not include external brokers or an LLM; those
+are deployment concerns rather than part of the local relay protocol.
+`.github/workflows/ci.yml` runs the test suite above against a PostgreSQL
+service container on every push/PR, then, on `main` only, builds the Docker
+image (tagged uniquely per build, not `:latest`) and rolls it out to the
+local `kind` cluster from a self-hosted runner registered on the machine
+that owns that cluster, waiting for the rollout to finish.
+
+### Run the CI workflow locally with `act`
+
+Both jobs can be exercised locally with [`act`](https://github.com/nektos/act)
+(`brew install act`) before pushing, against the real Docker daemon and the
+real `kind` cluster:
+
+```bash
+export DOCKER_HOST="unix://$HOME/.docker/run/docker.sock"  # Docker Desktop's socket path, not /var/run/docker.sock
+act push -j test -P ubuntu-latest=catthehacker/ubuntu:act-latest
+act push -j build-and-deploy -P self-hosted=-self-hosted
+```
+
+`-P self-hosted=-self-hosted` tells `act` to run that job's steps directly on
+the host instead of inside a container — the same way a real self-hosted
+runner works, and the only way the job can reach `docker`, `kind`, and your
+kubeconfig's `kind-agent-relay` context.
