@@ -1,9 +1,8 @@
-"""SQLite database setup and durable Agent Relay models.
+"""PostgreSQL database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module is intentionally the only place that knows about the database
+engine and its row-locking claim transactions.  The rest of the application
+talks to the models through :mod:`storage`.
 """
 
 from __future__ import annotations
@@ -13,13 +12,17 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Generator
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    return (
+        os.getenv("RELAY_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or "postgresql+psycopg://agent_relay:agent_relay@localhost:5433/agent_relay"
+    )
 
 
 def positive_int(name: str, default: int) -> int:
@@ -44,7 +47,7 @@ def utcnow() -> datetime:
 
 
 def as_db_time(value: datetime) -> datetime:
-    """SQLite's DateTime implementation is most portable with naive UTC."""
+    """Store timestamps as naive UTC; ``DateTime`` columns assume UTC throughout."""
 
     return value.astimezone(timezone.utc).replace(tzinfo=None)
 
@@ -130,30 +133,8 @@ class Attempt(Base):
     task: Mapped[Task] = relationship("Task", back_populates="attempts")
 
 
-def _is_sqlite(url: str) -> bool:
-    return url.startswith("sqlite")
-
-
-engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
-if _is_sqlite(DATABASE_URL):
-    engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
-    if DATABASE_URL in {"sqlite://", "sqlite:///:memory:"}:
-        from sqlalchemy.pool import StaticPool
-
-        engine_kwargs["poolclass"] = StaticPool
-
+engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True, "pool_size": 20, "max_overflow": 20}
 engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
-
-if _is_sqlite(DATABASE_URL):
-
-    @event.listens_for(engine, "connect")
-    def _sqlite_pragmas(dbapi_connection: Any, _connection_record: Any) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=30000")
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.close()
-
 
 SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False, autoflush=True)
 
@@ -175,47 +156,40 @@ def db_session() -> Generator[Session, None, None]:
         db.close()
 
 
-@contextmanager
-def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+def recover_expired_in_session(db: Session, now: datetime) -> int:
+    """Expire active leases and requeue/fail their tasks within ``db``.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    Every mutator of a task's attempts (claim, heartbeat, terminal submission,
+    and this recovery pass) locks the parent ``Task`` row with ``SELECT ...
+    FOR UPDATE`` before touching it, always in that order. That single
+    per-task lock is what makes each of those operations atomic with respect
+    to the others; a plain read of the attempt below is safe once the lock is
+    held because nothing else can be mutating this task's attempts
+    concurrently.
     """
 
-    connection = engine.connect()
-    session = Session(bind=connection, expire_on_commit=False, autoflush=True)
-    try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
-        yield session
-        session.flush()
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        session.close()
-        connection.close()
-
-
-def recover_expired_in_session(db: Session, now: datetime) -> int:
-    """Expire active leases and requeue/fail their tasks within ``db``."""
-
     now_db = as_db_time(now)
-    expired = list(
+    candidate_task_ids = list(
         db.scalars(
-            select(Attempt)
+            select(Attempt.task_id)
             .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
+            .distinct()
         )
     )
     count = 0
-    for attempt in expired:
-        task = db.get(Task, attempt.task_id)
-        if task is None or attempt.outcome != "processing":
+    for task_id in candidate_task_ids:
+        task = db.get(Task, task_id, with_for_update=True)
+        if task is None:
+            continue
+        # Re-check under the lock: another process may have already recovered
+        # or completed this attempt since the unlocked scan above.
+        attempt = db.scalar(
+            select(Attempt)
+            .where(Attempt.task_id == task_id, Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+            .order_by(Attempt.attempt_number.desc())
+            .limit(1)
+        )
+        if attempt is None:
             continue
         attempt.outcome = "expired"
         attempt.finished_at = now_db
@@ -235,7 +209,7 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
 def recover_expired() -> int:
     """Run one recovery pass and return the number of expired attempts."""
 
-    with immediate_transaction() as db:
+    with db_session() as db:
         return recover_expired_in_session(db, utcnow())
 
 
@@ -255,7 +229,6 @@ __all__ = [
     "db_session",
     "db_time",
     "engine",
-    "immediate_transaction",
     "init_db",
     "iso_time",
     "recover_expired",

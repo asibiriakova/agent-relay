@@ -1,29 +1,34 @@
-"""Live integration test: real HTTP server, real worker process, real SQLite DB.
+"""Live integration test: real HTTP server, real worker process, real PostgreSQL DB.
 
 Unlike test_agent_relay.py, which drives the app in-process via FastAPI's
 TestClient, this test launches ``uvicorn`` and the deterministic worker as
 separate OS processes -- exactly as a user would run them per README.md --
 and talks to them only over the network. It exercises the full documented
 flow (register two agents, submit a task, run the worker, observe
-completion) against the actual API surface and an on-disk SQLite file, then
-confirms the result by reading that file directly rather than trusting the
-API's own read path.
+completion) against the actual API surface and PostgreSQL, then confirms the
+result by reading the database directly rather than trusting the API's own
+read path.
 """
 
 from __future__ import annotations
 
 import os
 import socket
-import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import httpx
+import psycopg
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent
+
+LIVE_DATABASE_URL = os.environ.get(
+    "RELAY_DATABASE_URL",
+    "postgresql+psycopg://agent_relay:agent_relay@localhost:5433/agent_relay_test",
+)
 
 
 def free_port() -> int:
@@ -49,10 +54,9 @@ def wait_until_ready(base_url: str, process: subprocess.Popen, timeout: float = 
 
 
 @pytest.fixture
-def live_server(tmp_path: Path):
-    db_path = tmp_path / "agent-relay-live.db"
+def live_server():
     port = free_port()
-    env = {**os.environ, "RELAY_DATABASE_URL": f"sqlite:///{db_path}"}
+    env = {**os.environ, "RELAY_DATABASE_URL": LIVE_DATABASE_URL}
     process = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "main:app", "--port", str(port)],
         cwd=REPO_ROOT,
@@ -63,7 +67,7 @@ def live_server(tmp_path: Path):
     base_url = f"http://127.0.0.1:{port}"
     try:
         wait_until_ready(base_url, process)
-        yield base_url, env, db_path
+        yield base_url, env
     finally:
         process.terminate()
         try:
@@ -73,8 +77,8 @@ def live_server(tmp_path: Path):
             process.wait()
 
 
-def test_worker_process_completes_task_via_real_http_and_sqlite(live_server):
-    base_url, env, db_path = live_server
+def test_worker_process_completes_task_via_real_http_and_postgres(live_server):
+    base_url, env = live_server
 
     sender = httpx.post(f"{base_url}/api/v1/agents", json={"name": "alice"}, timeout=5).json()
     recipient = httpx.post(f"{base_url}/api/v1/agents", json={"name": "uppercase"}, timeout=5).json()
@@ -125,9 +129,7 @@ def test_worker_process_completes_task_via_real_http_and_sqlite(live_server):
     assert body["output"] == "HELLO WORLD"
 
     # Confirm persistence independently of the API's own read path.
-    conn = sqlite3.connect(str(db_path))
-    try:
-        row = conn.execute("SELECT status, output FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    finally:
-        conn.close()
+    dsn = LIVE_DATABASE_URL.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute("SELECT status, output FROM tasks WHERE id = %s", (task_id,)).fetchone()
     assert row == ("completed", "HELLO WORLD")

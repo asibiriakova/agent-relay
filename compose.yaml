@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent_relay
+      POSTGRES_PASSWORD: agent_relay
+      POSTGRES_DB: agent_relay
+    ports:
+      # Published on 5433 to avoid colliding with a PostgreSQL instance a
+      # developer may already run locally on the standard 5432. The app
+      # service always talks to this container over the compose network as
+      # postgres:5432, regardless of this host mapping.
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_relay -d agent_relay"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    environment:
+      RELAY_DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay@postgres:5432/agent_relay
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # depends_on/service_healthy orders container start, but the app's own
+    # network namespace (embedded DNS in particular) can need a moment past
+    # that to settle. main.py resolves and connects to the database at
+    # import time with no retry, so a losing race on the very first attempt
+    # is a hard crash; restart it rather than leaving it exited.
+    restart: on-failure:5
+
+volumes:
+  postgres-data:
